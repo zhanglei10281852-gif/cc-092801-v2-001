@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, LeaseExpiredError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
 
 
@@ -99,58 +99,77 @@ class ComputeOperationsService:
                 return None
             return dict(repository.task_by_id(candidate["id"]))
 
-    def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
+    def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int, attempt_count: int | None = None) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
-        with transaction(immediate=True) as connection:
-            cursor = connection.execute(
-                "UPDATE compute_tasks SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
-                (expires, now, task_id, worker_id),
-            )
-            if cursor.rowcount != 1:
-                raise ConflictError("任务未由当前工作者持有")
-            return dict(ComputeRepository(connection).task_by_id(task_id))
-
-    def complete(self, task_id: int, worker_id: str, result: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
-        now = to_storage(self.clock.now())
+        rejection: ConflictError | None = None
+        outcome: dict[str, Any] = {}
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
-            if task["status"] != "running" or task["lease_owner"] != worker_id:
-                raise ConflictError("任务未由当前工作者持有")
-            version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
-            connection.execute(
-                "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"result": result, "metrics": metrics}), worker_id, now),
-            )
-            connection.execute(
-                "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                (version, now, now, task_id),
-            )
-            return dict(repository.task_by_id(task_id))
+            rejection = self._receipt_guard(connection, repository, task, worker_id, now, attempt_count, "心跳请求")
+            if rejection is None:
+                connection.execute(
+                    "UPDATE compute_tasks SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=?",
+                    (expires, now, task_id),
+                )
+                outcome = dict(repository.task_by_id(task_id))
+        if rejection is not None:
+            raise rejection
+        return outcome
 
-    def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+    def complete(self, task_id: int, worker_id: str, result: dict[str, Any], metrics: dict[str, Any], attempt_count: int | None = None) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        rejection: ConflictError | None = None
+        outcome: dict[str, Any] = {}
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError("计算任务不存在")
+            rejection = self._receipt_guard(connection, repository, task, worker_id, now, attempt_count, "完成回执")
+            if rejection is None:
+                version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
+                connection.execute(
+                    "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"result": result, "metrics": metrics}), worker_id, now),
+                )
+                connection.execute(
+                    "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                    (version, now, now, task_id),
+                )
+                outcome = dict(repository.task_by_id(task_id))
+        if rejection is not None:
+            raise rejection
+        return outcome
+
+    def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool, attempt_count: int | None = None) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
+        rejection: ConflictError | None = None
+        outcome: dict[str, Any] = {}
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
-            if task["status"] != "running" or task["lease_owner"] != worker_id:
-                raise ConflictError("任务未由当前工作者持有")
-            can_retry = retryable and int(task["attempt_count"]) < int(task["max_attempts"])
-            status = "queued" if can_retry else "failed"
-            delay = min(300, 2 ** max(0, int(task["attempt_count"]) - 1)) if can_retry else 0
-            available = to_storage(now_value + timedelta(seconds=delay))
-            connection.execute(
-                "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
-            )
-            return dict(repository.task_by_id(task_id))
+            rejection = self._receipt_guard(connection, repository, task, worker_id, now, attempt_count, "失败回执")
+            if rejection is None:
+                can_retry = retryable and int(task["attempt_count"]) < int(task["max_attempts"])
+                status = "queued" if can_retry else "failed"
+                delay = min(300, 2 ** max(0, int(task["attempt_count"]) - 1)) if can_retry else 0
+                available = to_storage(now_value + timedelta(seconds=delay))
+                connection.execute(
+                    "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+                    (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
+                )
+                outcome = dict(repository.task_by_id(task_id))
+        if rejection is not None:
+            raise rejection
+        return outcome
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
         return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
@@ -195,25 +214,59 @@ class ComputeOperationsService:
             repository = ComputeRepository(connection)
             rows = connection.execute("SELECT * FROM compute_tasks WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
             for task in rows:
-                before = dict(task)
+                self._apply_lease_recovery(connection, repository, task, now, actor)
                 if int(task["attempt_count"]) < int(task["max_attempts"]):
-                    status, finished_at = "queued", None
                     recovered.append(int(task["id"]))
                 else:
-                    status, finished_at = "failed", now
                     exhausted.append(int(task["id"]))
-                connection.execute(
-                    "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='工作者租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                    (status, now, finished_at, now, task["id"]),
-                )
-                after = dict(repository.task_by_id(task["id"]))
-                repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
         return {"recovered": recovered, "exhausted": exhausted}
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
         oldest = self.connection.execute("SELECT MIN(created_at) FROM compute_tasks WHERE status='queued'").fetchone()[0]
         return {"states": {row["status"]: row["amount"] for row in rows}, "oldest_queued_at": oldest, "templates": len(self.repository.active_templates())}
+
+    @staticmethod
+    def _lease_expired(task: sqlite3.Row, now: str) -> bool:
+        return bool(task["lease_expires_at"]) and task["lease_expires_at"] <= now
+
+    @staticmethod
+    def _apply_lease_recovery(connection: sqlite3.Connection, repository: ComputeRepository, task: sqlite3.Row, now: str, actor: str) -> None:
+        if int(task["attempt_count"]) < int(task["max_attempts"]):
+            status, finished_at = "queued", None
+        else:
+            status, finished_at = "failed", now
+        connection.execute(
+            "UPDATE compute_tasks SET status=?,lease_owner='',lease_expires_at='',available_at=?,last_error_code='lease_expired',last_error_message='工作者租约已过期',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
+            (status, now, finished_at, now, task["id"]),
+        )
+        after = dict(repository.task_by_id(task["id"]))
+        repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=dict(task), after=after, batch_key="", now=now)
+
+    def _receipt_guard(self, connection: sqlite3.Connection, repository: ComputeRepository, task: sqlite3.Row, worker_id: str, now: str, attempt_count: int | None, receipt: str) -> ConflictError | None:
+        """校验完成、失败与心跳回执；拒绝时把原因写入审计记录并返回待抛出的异常。"""
+        message: str | None = None
+        expired_owner = False
+        if task["status"] == "running" and self._lease_expired(task, now):
+            self._apply_lease_recovery(connection, repository, task, now, actor="lease-recovery")
+            expired_owner = task["lease_owner"] == worker_id
+            if expired_owner:
+                message = f"{receipt}被拒绝：领取时限已过（租约 {task['lease_expires_at']} 到期），服务单已安全回收"
+            else:
+                message = f"{receipt}被拒绝：任务未由当前工作者持有，过期领取已安全回收"
+        elif task["status"] != "running":
+            message = f"{receipt}被拒绝：服务单当前状态（{task['status']}）不接受回执"
+        elif task["lease_owner"] != worker_id:
+            message = f"{receipt}被拒绝：服务单已由其他工作人员接手"
+        elif attempt_count is not None and int(attempt_count) != int(task["attempt_count"]):
+            message = f"{receipt}被拒绝：回执对应的领取已失效（当前为第 {task['attempt_count']} 次领取）"
+        if message is None:
+            return None
+        snapshot = dict(repository.task_by_id(task["id"]))
+        repository.add_intervention(task_id=task["id"], actor=worker_id, action="receipt_rejected", reason=message, before=snapshot, after=snapshot, batch_key="", now=now)
+        if expired_owner:
+            return LeaseExpiredError(message, context={"lease_expires_at": task["lease_expires_at"]})
+        return ConflictError(message)
 
     def _intervene(self, task_id: int, actor: str, reason: str, action: str, batch_key: str, mutation: Callable[[sqlite3.Connection, sqlite3.Row, str], None]) -> dict[str, Any]:
         now = to_storage(self.clock.now())

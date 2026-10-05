@@ -21,6 +21,10 @@ class ConflictError(DomainError):
     code = "conflict"
 
 
+class LeaseExpiredError(ConflictError):
+    code = "lease_expired"
+
+
 class AuthenticationError(DomainError):
     status_code = 401
     code = "authentication_failed"

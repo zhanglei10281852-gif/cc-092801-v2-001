@@ -38,10 +38,17 @@ class TaskClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class TaskHeartbeat(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=120)
+    lease_seconds: int = Field(default=60, ge=5, le=3600)
+    attempt_count: int | None = Field(default=None, ge=0)
+
+
 class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     result: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
+    attempt_count: int | None = Field(default=None, ge=0)
 
 
 class TaskFailure(BaseModel):
@@ -49,6 +56,7 @@ class TaskFailure(BaseModel):
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True
+    attempt_count: int | None = Field(default=None, ge=0)
 
 
 class CancelRequest(BaseModel):
