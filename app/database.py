@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
+    lease_epoch INTEGER NOT NULL DEFAULT 0,
     lease_expires_at TEXT NOT NULL DEFAULT '',
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
@@ -359,10 +360,23 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_column(connection: sqlite3.Connection, *, table: str, column: str, definition: str) -> None:
+    """幂等地为旧版本数据库补齐缺失列（CREATE TABLE IF NOT EXISTS 不会改既有表结构）。"""
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_column(
+            connection,
+            table="compute_tasks",
+            column="lease_epoch",
+            definition="INTEGER NOT NULL DEFAULT 0",
+        )
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

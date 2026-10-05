@@ -38,14 +38,22 @@ class TaskClaim(BaseModel):
     lease_seconds: int = Field(default=60, ge=5, le=3600)
 
 
+class TaskHeartbeat(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=120)
+    lease_seconds: int = Field(default=60, ge=5, le=3600)
+    lease_epoch: int = Field(ge=0, description="领取时下发的领取世代，用于隔离旧领取的回执")
+
+
 class TaskResult(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=0, description="领取时下发的领取世代，用于隔离旧领取的回执")
     result: dict[str, Any]
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskFailure(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=0, description="领取时下发的领取世代，用于隔离旧领取的回执")
     error_code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=2000)
     retryable: bool = True

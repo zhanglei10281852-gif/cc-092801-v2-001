@@ -21,6 +21,12 @@ class ConflictError(DomainError):
     code = "conflict"
 
 
+class LeaseStaleError(ConflictError):
+    """旧持有者在租约过期/被回收/世代不符后仍提交回执。"""
+
+    code = "lease_stale"
+
+
 class AuthenticationError(DomainError):
     status_code = 401
     code = "authentication_failed"
